@@ -1,6 +1,13 @@
 from imaplib import IMAP4, IMAP4_SSL
 
 from .base import EmailTransport, MessageParseError
+from django.conf import settings
+
+MAX_MESSAGE_SIZE = getattr(
+    settings,
+    'DJANGO_MAILBOX_MAX_MESSAGE_SIZE',
+    False
+)
 
 
 class GmailTransport(EmailTransport):
@@ -8,7 +15,7 @@ class GmailTransport(EmailTransport):
         self.hostname = hostname
         self.port = port
         self.exclusive = False
-        self.MAX_MSG_SIZE = 2000000
+        self.MAX_MSG_SIZE = MAX_MESSAGE_SIZE
         if ssl:
             self.transport = IMAP4_SSL
             if not self.port:
@@ -32,22 +39,29 @@ class GmailTransport(EmailTransport):
         # username should be an email address that has already been authorized
         # for gmail access
         try:
-            from google_api import (
+            from django_mailbox.google_utils import (
                 get_google_access_token,
-                fetch_user_info)
-
+                fetch_user_info,
+                AccessTokenNotFound,
+            )
         except ImportError:
             raise ValueError(
                 "Install python-social-auth to use oauth2 auth for gmail"
             )
 
-        try:
-            access_token = get_google_access_token(username)
-            google_email_address = fetch_user_info(username)[u'email']
-        except TypeError:
-            # Sometimes we have to try again
-            access_token = get_google_access_token(username)
-            google_email_address = fetch_user_info(username)[u'email']
+        access_token = None
+        while access_token is None:
+            try:
+                access_token = get_google_access_token(username)
+                google_email_address = fetch_user_info(username)['email']
+            except TypeError:
+                # This means that the google process took too long
+                # Trying again is the right thing to do
+                pass
+            except AccessTokenNotFound:
+                raise ValueError(
+                    "No Token available in python-social-auth for %s" % username
+                )
 
         auth_string = 'user=%s\1auth=Bearer %s\1\1' % (
             google_email_address,
@@ -65,14 +79,6 @@ class GmailTransport(EmailTransport):
         response, message_ids = self.server.uid('search', None, 'UNSEEN', )
         return message_ids[0].split(' ')
 
-    def _archive_message(self, uid):
-        # Move to "[Gmail]/All Mail" folder
-        pass
-
-    def _trash_message(self, uid):
-        # Move to "[Gmail]/Trash"
-        pass
-
     def _delete_message(self, uid):
         # add Deleted Flag
         self.server.store(uid, "+FLAGS", "\\Deleted")
@@ -84,7 +90,7 @@ class GmailTransport(EmailTransport):
             'fetch',
             ','.join(message_ids),
             '(BODY.PEEK[HEADER] RFC822.SIZE BODYSTRUCTURE)'
-            )
+        )
 
         for each_msg in data:
             if isinstance(each_msg, tuple):
@@ -102,13 +108,18 @@ class GmailTransport(EmailTransport):
 
     def get_message(self):
         # Fetch a list of message uids to process
+        # If we're the exclusive handlers of the mailbox,
+        # we can assume that all messages are ours.
+        # If not, we should only pull the unread ones
         if self.exclusive:
             message_ids = self._get_all_message_ids()
         else:
             message_ids = self._get_unread_message_ids()
-        print "There are %s messages: %s" % (len(message_ids), message_ids)
+
         if self.MAX_MSG_SIZE:
             message_ids = self._get_small_message_ids(message_ids)
+
+        #print "There are %s messages: %s" % (len(message_ids), message_ids)
 
         if not message_ids:
             return
@@ -120,6 +131,7 @@ class GmailTransport(EmailTransport):
                 yield message
             except MessageParseError:
                 continue
+            # Only delete them if we're the only ones who care
             if self.exclusive:
                 self.server.store(uid, "+FLAGS", "\\Deleted")
         self.server.expunge()
